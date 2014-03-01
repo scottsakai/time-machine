@@ -19,6 +19,14 @@ Fifo::Fifo() {
 Fifo::~Fifo() {
 	tmlog(TM_LOG_DEBUG, "storage",  "Fifo::~Fifo");
 	if (started) {
+		// write mem to disk
+		uint64_t i = 0;
+		uint64_t n = 0;
+		while (( n = pktEviction()) != 0) {
+			i += n;
+		}
+		tmlog(TM_LOG_DEBUG, "storage",  "Fifo::~Fifo wrote %d packets to disk.", i);
+
 		pcap_freecode(&fp);
 	}
 	started=false;
@@ -186,28 +194,48 @@ uint64_t Fifo::query(QueryRequest *qreq, QueryResult *qres,
 				 IntervalSet *interval_set) {
 	uint64_t matches = 0;
 	FifoDiskFile *cur_file;
+	std::queue<FifoDiskFile*> intersectedFiles;
 
 	if (!qreq->isMemOnly()) {
 		fd->incQueryInProgress();
-		IntervalSet::iterator i_i = interval_set->begin();
+
+		// locate intersecting files
 		std::list <FifoDiskFile*>::iterator f_i=fd->filesBeginIt();
-		while ( f_i!=fd->filesEndIt() && i_i != interval_set->end() ) {
+		while ( f_i!=fd->filesEndIt() ) {
 			cur_file = *f_i;
 			f_i++;
 #ifdef QUERY_RACE_PROTECT
 			if (f_i == fd->filesEndIt())
 				fm->lock();
 #endif
-			/* Check time interval */ 
-			tmlog(TM_LOG_WARN, "query", "%d Fifo::query: start-end=[%lf,%lf] * curfile=[%lf,%lf] * fn=%s",
-					qres->getQueryID(), qreq->getT0(), qreq->getT1(), 
-					cur_file->getOldestTimestamp(), cur_file->getNewestTimestamp(),
-					cur_file->getFilename().c_str());
-			if ( (qreq->getT1()+1e-3 >= cur_file->getOldestTimestamp()) &&
-					(qreq->getT0()-1e-3 <= cur_file->getNewestTimestamp()) ) {
-				matches+= cur_file->query(qreq, qres, interval_set);
+			for (IntervalSet::iterator i_i = interval_set->begin(); i_i != interval_set->end(); i_i++) {
+
+				// skip files that are clearly not for this interval.
+				if (i_i->getStart()-1e-3 > cur_file->getNewestTimestamp() ||
+				i_i->getLast()+1e-3 < cur_file->getOldestTimestamp()) {
+					continue;
+				}
+				
+				intersectedFiles.push(cur_file);
+				break;
 			}
 		}
+
+		// query intersecting files
+		while (!intersectedFiles.empty()) {
+			cur_file = intersectedFiles.front();
+			intersectedFiles.pop();
+
+			tmlog(TM_LOG_WARN, "query", "%d Fifo::query: start-end=[%lf,%lf] * curfile=[%lf,%lf] * fn=%s",
+				qres->getQueryID(), qreq->getT0(), qreq->getT1(), 
+				cur_file->getOldestTimestamp(), cur_file->getNewestTimestamp(),
+				cur_file->getFilename().c_str());
+
+			tmlog(TM_LOG_WARN, "query", "%d Fifo::query: Searching file %s", qres->getQueryID(), cur_file->getFilename().c_str());
+
+			matches+= cur_file->query(qreq, qres, interval_set);
+		}
+
 		fd->decQueryInProgress();
 	}
 #ifdef QUERY_RACE_PROTECT

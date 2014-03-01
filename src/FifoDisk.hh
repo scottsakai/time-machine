@@ -4,6 +4,7 @@
 #include <pcap.h>
 #include <list>
 #include <string>
+#include <dirent.h>
 
 #include "types.h"
 #include "tm.h"
@@ -67,6 +68,7 @@ public:
 	void decQueryInProgress() { };
 #endif
 
+
 protected:
 	std::string classname;
 	std::list <FifoDiskFile*> files;
@@ -87,21 +89,33 @@ protected:
 
 class FifoDiskFile {
 public:
-	FifoDiskFile(const std::string& filename, pcap_t*);
+	FifoDiskFile(const std::string& filename, pcap_t*, int flags=FIFO_DISK_FILE_DEFAULT);
 	~FifoDiskFile();
 	void open();
 	void close();
 	void remove();
-	void addPkt(const struct pcap_pkthdr *header, const unsigned char *packet);
+	void writePkt(const struct pcap_pkthdr *header, const unsigned char *packet);
 	void addPkt(pkt_ptr p);
 	int64_t getCurFileSize() {
-		return cur_file_size;
+		int64_t t;
+		lockMetadata();
+		t = cur_file_size;
+		unlockMetadata();
+		return t;
 	}
 	uint64_t getHeldBytes() {
-		return held_bytes;
+		uint64_t t;
+		lockMetadata();
+		t = held_bytes;
+		unlockMetadata();
+		return t;
 	}
 	uint64_t getHeldPkts() {
-		return held_pkts;
+		uint64_t t;
+		lockMetadata();
+		t = held_pkts;
+		unlockMetadata();
+		return t;
 	}
 	tm_time_t getOldestTimestamp() {
 		return oldest_timestamp;
@@ -115,20 +129,77 @@ public:
 	bool flush() {
 		return pcap_dump_flush(pcap_dumper_handle)==0;
 	}
+
+	bool valid() {
+		return is_valid;
+	}
+	bool operator<(FifoDiskFile *rhs);
+
 	/* iterator will be increased up to the first interval completeley
 	   not in file */
 	uint64_t query( QueryRequest*, QueryResult*, IntervalSet*);
+
+	bool flushQueue();
 protected:
+	void loadStateFromSummary();
+	void loadStateFromPcap();
+	void loadState();
+	void writeSummaryFile();
+
+	void lockMetadata() {
+		pthread_mutex_lock(&metadata_lock_mutex);
+	};
+
+	bool tryLockMetadata() {
+		if (pthread_mutex_trylock(&metadata_lock_mutex) == 0) {
+			return true;
+		}
+		return false;
+	};
+
+	void unlockMetadata() {
+		pthread_mutex_unlock(&metadata_lock_mutex);
+	};
+		
+	void lockQueue() {
+		pthread_mutex_lock(&queue_lock_mutex);
+	};
+
+	bool tryLockQueue() {
+		if (pthread_mutex_trylock(&queue_lock_mutex) == 0) {
+			return true;
+		}
+		return false;
+	};
+	
+	void unlockQueue() {
+		pthread_mutex_unlock(&queue_lock_mutex);
+	};
+
+
 	std::string filename;
 	bool is_open;
+	bool is_valid;
+	bool is_dirty;
+	bool exit_writer;
 	pcap_dumper_t *pcap_dumper_handle;
 	int64_t cur_file_size;
 	uint64_t held_bytes;
+	uint64_t pkt_hdr_size;
 	uint64_t held_pkts;
 	pcap_t *pcap_handle;
 	tm_time_t oldest_timestamp;
 	tm_time_t newest_timestamp;
+	pthread_mutex_t metadata_lock_mutex;
+	pthread_mutex_t queue_lock_mutex;
+	pthread_mutex_t write_cond_lock_mutex;
+	pthread_cond_t  write_cond;
+	pthread_t writer_thread;
+	std::queue<pkt_ptr> writeQueue;
 };
 
 
+
+void* writerMain(void*);
+bool FifoDiskFileCmp( FifoDiskFile *&lhs, FifoDiskFile *&rhs);
 #endif /* FIFODISK_HH */

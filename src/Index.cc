@@ -38,8 +38,10 @@ Index<T>::Index(tm_time_t d_t, uint32_t hash_size, bool do_disk_index, Storage *
 		rotate_count(0){
 	cur = new IndexHash(hash_size);
 	old = new IndexHash(hash_size);
-	if (do_disk_index)
+	if (do_disk_index){
 		disk_index = new IndexFiles<T>((std::string)conf_main_indexdir, "index_"+T::getIndexNameStatic());
+		assert(disk_index->isValid());
+	}
 	else
 		disk_index = NULL;
 	pthread_mutex_init(&hash_lock_mutex, NULL);
@@ -56,6 +58,15 @@ Index<T>::~Index() {
 	pthread_mutex_destroy(&queue_lock_mutex);
 	pthread_cond_destroy(&queue_cond);
 	//pthread_mutex_trylock(&queue_lock_mutex);
+
+	// save the indexes to disk
+	if (disk_index) {
+		tmlog(TM_LOG_NOTE, T::getIndexNameStatic().c_str(), 
+			"Writing %d entries to disk.",  old->getNumEntries());
+		disk_index->writeIndex(old);
+		disk_index->writeIndex(cur);
+	}	
+
 	std::deque<IndexField *>::iterator it;
 	while (!input_q.empty()) {
 		delete input_q.back();
@@ -195,6 +206,7 @@ void Index<T>::addEntry(IndexField *iqe) {
 
 	/* Add the entry */
 	IndexEntry* ie=cur->lookup(iqe);
+	last_updated = iqe->ts;
 	if (ie==NULL) {
 		/* the key (ieq->indexField) is now owned by the IndexEntry, resp.
 		 * the hash. they will take care about deallocation */
@@ -207,7 +219,6 @@ void Index<T>::addEntry(IndexField *iqe) {
 		/* Update an entry. key is no longer needed, so we free it's memory */
 		delete iqe;
 	}
-	last_updated = iqe->ts;
 }
 
 template <class T>
@@ -266,18 +277,6 @@ template <class T>
 void Index<T>::lookupDisk(IntervalSet* set, IndexField* key, tm_time_t t0, tm_time_t t1) {
 	if (disk_index)
 		disk_index->lookup(set, key, t0, t1);
-}
-
-template <class T>
-void Index<T>::aggregate() {
-	if (!disk_index)
-		return;
-	tm_time_t oldestTimestampDisk; 
-	//FIXME: do we really have to lock the queue here??
-	lock_queue(); 
-	oldestTimestampDisk = this->idx_thread_oldestTimestampDisk;
-	unlock_queue();
-	disk_index->aggregate(oldestTimestampDisk);
 }
 
 /* Main method of the index maintainer thread

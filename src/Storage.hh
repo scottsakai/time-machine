@@ -119,7 +119,6 @@ private:
 	tm_time_t conn_timeout;
 	uint64_t tot_num_queries;
 	uint64_t tot_queries_duration;
-
 };
 
 #endif

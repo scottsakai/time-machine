@@ -62,6 +62,8 @@ void QueryRequest::compileBPF() {
 		tmlog(TM_LOG_DEBUG, "query", "QueryRequest::compileBPF(): pcap_compile(): Problem expression was: ", bpf_str);
 		return;
 	}
+
+		//tmlog(TM_LOG_DEBUG, "query", "QueryRequest::compileBPF(): pcap_compile(): Compiled expression was: ", bpf_str);
 	have_bpf=true;
 }
 
@@ -70,7 +72,7 @@ QueryResultFile::QueryResultFile(int queryID, const std::string& filename, int l
 	: QueryResult(queryID)
 {
 	ph = pcap_open_dead(linktype, snaplen);
-	f = new FifoDiskFile(conf_main_queryfiledir+std::string("/")+filename, ph);
+	f = new FifoDiskFile(conf_main_queryfiledir+std::string("/")+filename, ph, FIFO_DISK_FILE_DEFAULT | FIFO_DISK_FILE_ENAB_TRUNC);
 }
 
 QueryResultFile::~QueryResultFile() {
@@ -84,7 +86,7 @@ bool QueryResultFile::sendPkt(const struct pcap_pkthdr *header,
 	// enough at the moment, we don't lock!!
 	querySentPkts++;
 	querySentBytes += header->caplen;
-	f->addPkt(header, packet);
+	f->writePkt(header, packet);
 	return true;
 	//  f->flush();
 }
@@ -94,7 +96,7 @@ bool QueryResultFile::sendPkt(pkt_ptr p) {
 	// enough at the moment, we don't lock!!
 	querySentPkts++;
 	querySentBytes += ((struct pcap_pkthdr *)p)->caplen;
-	f->addPkt(p);
+	f->writePkt((struct pcap_pkthdr*)p, (unsigned char*)p + sizeof(struct pcap_pkthdr));
 	return true;
 	//  f.flush();
 }

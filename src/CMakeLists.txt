@@ -60,6 +60,8 @@ set(timemachine_SRCS
     Queue.hh
     Storage.cc
     Storage.hh
+    util.cc
+    util.h
     conf.h
     jhash3.h
     ${CMAKE_CURRENT_BINARY_DIR}/main.cc
@@ -75,17 +77,18 @@ set(tm_query_benchmark_SRCS
 
 add_subdirectory(re2)
 add_subdirectory(pcapnav)
+add_subdirectory(sqlite3)
 
 if (USE_BROCCOLI)
     include_directories(${Broccoli_INCLUDE_DIR})
     list(APPEND OPTLIBS ${Broccoli_LIBRARY})
 
     add_executable(tm_query_benchmark ${tm_query_benchmark_SRCS})
-    target_link_libraries(tm_query_benchmark ${CMAKE_THREAD_LIBS_INIT} ${OPTLIBS} ${PCAP_LIBRARY} re2Static)
+    target_link_libraries(tm_query_benchmark ${CMAKE_THREAD_LIBS_INIT} ${OPTLIBS} ${PCAP_LIBRARY} re2Static sqlite3Static)
 endif()
 
 add_executable(timemachine ${timemachine_SRCS})
-target_link_libraries(timemachine ${CMAKE_THREAD_LIBS_INIT} ${PCAP_LIBRARY} ${Readline_LIBRARY} ${OPTLIBS} re2Static pcapnavStatic)
+target_link_libraries(timemachine ${CMAKE_THREAD_LIBS_INIT} ${PCAP_LIBRARY} ${Readline_LIBRARY} ${OPTLIBS} re2Static pcapnavStatic sqlite3Static)
 
 if (NOT TimeMachine_SKIP_INSTALL)
     install(TARGETS timemachine DESTINATION bin)

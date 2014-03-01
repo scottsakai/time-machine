@@ -78,7 +78,7 @@ std::string IPAddress::getStr() const {
 }
 
 void IPAddress::getBPFStr(char *str, int max_str_len) const {
-	int rc = snprintf(str, max_str_len, "host %s", getStr().c_str());
+	int rc = snprintf(str, max_str_len, "host %s or (vlan and host %s)", getStr().c_str(), getStr().c_str());
 	if ( rc >= max_str_len )
 		tmlog(TM_LOG_ERROR, "query",  "IPAddress::getBPFStr: %s truncated by %d characters",
 				str, rc-max_str_len);
@@ -95,7 +95,7 @@ std::list<SrcIPAddress*> SrcIPAddress::genKeys(const u_char* packet) {
 }
 
 void SrcIPAddress::getBPFStr(char *str, int max_str_len) const {
-	int rc = snprintf(str, max_str_len, "src host %s", getStr().c_str());
+	int rc = snprintf(str, max_str_len, "src host %s or (vlan and src host %s)", getStr().c_str(), getStr().c_str());
 	if ( rc >= max_str_len )
 		tmlog(TM_LOG_ERROR, "query",  "SrcIPAddress::getBPFStr: %s truncated by %d characters",
 				str, rc-max_str_len);
@@ -112,7 +112,7 @@ std::list<DstIPAddress*> DstIPAddress::genKeys(const u_char* packet) {
 }
 
 void DstIPAddress::getBPFStr(char *str, int max_str_len) const {
-	int rc = snprintf(str, max_str_len, "dst host %s", getStr().c_str());
+	int rc = snprintf(str, max_str_len, "dst host %s or (vlan and dst host %s)", getStr().c_str(), getStr().c_str());
 	if ( rc >= max_str_len )
 		tmlog(TM_LOG_ERROR, "query",  "DstIPAddress::getBPFStr: %s truncated by %d characters",
 				str, rc-max_str_len);
@@ -159,7 +159,7 @@ std::string Port::getStr() const {
 }
 
 void Port::getBPFStr(char *str, int max_str_len) const {
-	int rc = snprintf(str, max_str_len, "port %u", ntohs(port));
+	int rc = snprintf(str, max_str_len, "port %u or (vlan and port %u)", ntohs(port), ntohs(port));
 	if ( rc >= max_str_len )
 		tmlog(TM_LOG_ERROR, "query",  "Port::getBPFStr: %s truncated by %d characters",
 				str, rc-max_str_len);
@@ -187,7 +187,7 @@ std::list<SrcPort*> SrcPort::genKeys(const u_char* packet) {
 }
 
 void SrcPort::getBPFStr(char *str, int max_str_len) const {
-	int rc = snprintf(str, max_str_len, "src port %s", getStr().c_str());
+	int rc = snprintf(str, max_str_len, "src port %s or (vlan and src port %s)", getStr().c_str(), getStr().c_str());
 	if ( rc >= max_str_len )
 		tmlog(TM_LOG_ERROR, "query",  "SrcPort::getBPFStr: %s truncated by %d characters",
 				str, rc-max_str_len);
@@ -215,7 +215,7 @@ std::list<DstPort*> DstPort::genKeys(const u_char* packet) {
 }
 
 void DstPort::getBPFStr(char *str, int max_str_len) const {
-	int rc = snprintf(str, max_str_len, "dst port %s", getStr().c_str());
+	int rc = snprintf(str, max_str_len, "dst port %s or (vlan and dst port %s)", getStr().c_str(), getStr().c_str());
 	if ( rc >= max_str_len )
 		tmlog(TM_LOG_ERROR, "query",  "DstPort::getBPFStr: %s truncated by %d characters",
 				str, rc-max_str_len);
@@ -281,7 +281,11 @@ void ConnectionIF4::getBPFStr(char *str, int max_str_len) const {
 	/*  }  */
 
 	snprintf(str, max_str_len,
-			 "host %s and port %d and host %s and port %d",
+			 "(host %s and port %d and host %s and port %d) or (vlan and host %s and port %d and host %s and port %d)",
+			 s_ip_str, 
+			 ntohs(s_port),
+			 d_ip_str,
+			 ntohs(d_port),
 			 s_ip_str, 
 			 ntohs(s_port),
 			 d_ip_str,
@@ -337,8 +341,12 @@ void ConnectionIF3::getBPFStr(char *str, int max_str_len) const {
 	ip_to_str(c_id.get_ip2(), ip2_str, sizeof(ip2_str));
 
 	snprintf(str, max_str_len,
-			 "(src host %s and dst host %s and dst port %d) or "
-			 "(dst host %s and src host %s and src port %d)",
+			 "((src host %s and dst host %s and dst port %d) or"
+			 " (dst host %s and src host %s and src port %d)) or"
+			 "(vlan and ((src host %s and dst host %s and dst port %d) or "
+			 "(dst host %s and src host %s and src port %d)))",
+			 ip1_str, ip2_str, ntohs(c_id.get_port()),
+			 ip1_str, ip2_str, ntohs(c_id.get_port()),
 			 ip1_str, ip2_str, ntohs(c_id.get_port()),
 			 ip1_str, ip2_str, ntohs(c_id.get_port()));
 }
@@ -383,10 +391,10 @@ void ConnectionIF2::getBPFStr(char *str, int max_str_len) const {
 
 
 	snprintf(str, max_str_len,
-			 "host %s and host %s",
+			 "(host %s and host %s) or"
+			 " (vlan and host %s and host %s)",
+			 s_ip_str, d_ip_str,
 			 s_ip_str, d_ip_str);
 }
-
-
 
 #endif

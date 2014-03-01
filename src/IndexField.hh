@@ -445,6 +445,7 @@ private:
 	static RE2 re;
 };
 
+
 inline IPAddress* IPAddress::genKey (const u_char* packet, int keynum)
 {
 	switch (keynum) {

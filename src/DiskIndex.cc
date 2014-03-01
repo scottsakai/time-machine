@@ -16,150 +16,19 @@
 #include "Query.hh"
 #include "IndexHash.hh"
 #include "conf.h"
-
+#include <unistd.h>
 #include <time.h>
 
-/* new glibc's (and/or) gcc's complain about not using the 
- * return value of certain functions. 
- * FIXME: Yes, we should check the retval here, but for that we would need
- * a way better error handling framework...
- */
-static void 
-my_fread (void* buf, size_t size, size_t nmemb, FILE* stream)
-{
-	// silence gcc
-	size_t rv = fread(buf, size, nmemb, stream);
-	if (rv)
-		; // do nothing
-}
+#include <sys/stat.h>
+#include <dirent.h>
+#include "util.h"
 
-static void
-my_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) 
-{
-	// silence gcc
-	size_t rv = fwrite(ptr, size, nmemb, stream);
-	if (rv)
-		; // do nothing
-}
 
-/***************************************************************************
- * class IndexFilesReader
- */
-inline IndexFileReader::IndexFileReader(char *fn) : fp(NULL), fname(fn), eof(false) {
-	fp = fopen(fn, "rb"); 
-	if (fp == NULL) {
-		//TODO: Decent error handling
-		tmlog(TM_LOG_ERROR, "IFR", "Could not open index file \"%s\" for reading.\n", fname);
-	}
-	my_fread(&first, sizeof(tm_time_t), 1, fp);
-	my_fread(&last, sizeof(tm_time_t), 1, fp);
-	my_fread(&keysize, sizeof(keysize), 1, fp);
-	keysize = ntohl(keysize);
-	entrysize = keysize + 2*sizeof(tm_time_t);
-	buffer = malloc(entrysize);
-	readNextEntry();
-}
+// use epsilon to enlarge time range by "just a little"
+#define EPS 1e-3
 
-inline IndexFileReader::~IndexFileReader() {
-	free(fname);
-	free(buffer);
-	fclose(fp);
-}
 
-inline const void *IndexFileReader::getCurEntry() {
-	if (eof)
-		return NULL;
-	else 
-		return buffer;
-}
 
-inline void IndexFileReader::readNextEntry() {
-	if (fread(buffer, entrysize, 1, fp) != 1)
-		eof = true;
-}
-
-inline void IndexFileReader::lookupEntry(IntervalSet *set, IndexField *key) {
-	long first_entry_off;
-	long num_entries;
-	bool found = false;
-	const void *keyptr;
-	long left, right, mid;  // Left, right and middle entry for binary search
-	int cmp;
-
-	if (!fp)
-		return;
-
-	keyptr = key->getConstKeyPtr();
-
-	first_entry_off = (2*sizeof(tm_time_t) + sizeof(keysize));
-	fseek(fp, 0, SEEK_END);
-	num_entries = ftell(fp);
-	num_entries -= first_entry_off;
-	// num_entries now contains the number of bytes occupied by
-	// entries in the file
-	
-	num_entries /= entrysize;
-	left = 0;
-	mid = 0;
-	cmp = -1;
-	right = num_entries-1; 
-	found = false;
-
-	//TODO:
-	// Check if key is less or greater than any key in the current file
-	/*fseek(fp, first_entry_off, SEEK_SET);
-	fread(buffer, keysize, 1, fp);
-	if (memcmp(buffer, keyptr, keysize) < 0)
-		return; 
-	fseek(fp, entrysize, SEEK_END);
-	fread(buffer, keysize, 1, fp);
-	if (memcmp(buffer, keyptr, keysize) > 0)
-		return; 
-*/
-	while(left<=right && !found) {
-		mid = left + (right-left)/2;
-		fseek(fp, first_entry_off+mid*entrysize, SEEK_SET);
-		my_fread(buffer, keysize, 1, fp);
-		cmp = memcmp(buffer, keyptr, keysize);
-		if (cmp < 0)   // mid < key
-			right = mid - 1;
-		else if (cmp > 0)
-			left = mid + 1;
-		else 
-			found = true;
-	}
-	if (!found) {
-		//fprintf(stderr, "Not found\n");
-		return; 
-	}
-
-	/* Go left until we find the first entry with the current key */
-	while (cmp==0 && mid>0 ) {
-		mid--;
-		fseek(fp, first_entry_off+mid*entrysize, SEEK_SET);
-		my_fread(buffer, keysize, 1, fp);
-		cmp = memcmp(buffer, keyptr, keysize);
-	}
-	if (cmp==0 && mid == 0) 
-		; // First entry contains the key
-	else 
-		mid++; // else: we left the loop because cmp!=0.
-		// increment mid. mid now points to the first entry with key
-	cmp = 0; 
-	fseek(fp, first_entry_off+mid*entrysize, SEEK_SET);
-	while(fread(buffer, entrysize, 1, fp)==1) {
-		Interval iv = Interval(0,0);
-		cmp = memcmp(buffer, keyptr, keysize);
-		if (cmp != 0) 
-			break;
-		iv.getStart() = *((tm_time_t*)((char *)buffer+keysize));
-		iv.getLast() = *((tm_time_t*)((char *)buffer+keysize+sizeof(tm_time_t)));
-		tmlog(TM_LOG_DEBUG, "query", "IFR::lookupEntry: adding interval [%lf,%lf]",
-				iv.getStart(), iv.getLast());
-		set->add(iv);
-	}
-	
-}
 /***************************************************************************
  * class IndexFiles<T>
  */
@@ -168,97 +37,241 @@ template <class T>
 IndexFiles<T>::IndexFiles(const std::string& pathname, const std::string& indexname):
 		indexname(indexname),
 		pathname(pathname),
-		num_aggregate_levels(3)
-		{
-			file_number = new uint32_t[num_aggregate_levels];
-			file_number_oldest = new uint32_t[num_aggregate_levels];
-			for (int i=0; i<num_aggregate_levels; i++) {
-				file_number[i] = file_number_oldest[i] = 0;
-			}
-			pthread_mutex_init(&file_number_mutex, NULL);
+		valid(false),
+		db(NULL),
+		stmt(NULL),
+		in_transaction(false)
+{
+	int rc = 0;
+
+	
+	/* we're going to stash everything in one sqlite file per indexname */
+	char index_fn[PATH_MAX];
+	memset(index_fn, 0, PATH_MAX);
+	snprintf(index_fn, PATH_MAX, "%s/%s.sqlite", pathname.c_str(), indexname.c_str());
+
+	/* open db */
+	if (sqlite3_open_v2(index_fn, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL)) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not open sqlite file %s: %s", index_fn, sqlite3_errmsg(db));
+		return;
+	}
+
+	/* set some pragmas. they can silently fail and the DB will still work */
+	sqlite3_exec(db, "PRAGMA synchronous = OFF;", NULL, NULL, NULL); // quick but dangerous. don't crash the host.
+	sqlite3_exec(db, "PRAGMA automatic_index = false;", NULL, NULL, NULL);
+	sqlite3_exec(db, "PRAGMA mmap_size = 1073741824;", NULL, NULL, NULL);
+
+	/* create the table if it doesn't exist. */
+	rc = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS tm_index (k BLOB, start REAL, end REAL);", NULL, NULL, NULL);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not create sqlite table in file %s: %s", index_fn, sqlite3_errmsg(db));
+		return;
+	}
+
+	/* create indexes on the table if they don't exist. */
+	// most searches will be against 'k'
+	rc = sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS index_tm_index_k ON tm_index(k)", NULL, NULL, NULL);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not create sqlite index on k in file %s: %s", index_fn, sqlite3_errmsg(db));
+		return;
+	}
+	// preening happens on 'end'
+	rc = sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS index_tm_index_end ON tm_index(end)", NULL, NULL, NULL);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not create sqlite index on end in file %s: %s", index_fn, sqlite3_errmsg(db));
+		return;
+	}
+	// do some deduplication
+	rc = sqlite3_exec(db, "CREATE TRIGGER IF NOT EXISTS tm_insert_dedup BEFORE INSERT ON tm_index "
+		" for each row when (select k from tm_index where k = NEW.k and start = NEW.start) IS NOT NULL "
+		" BEGIN "
+	        "  update tm_index set "
+		"    end = NEW.end "
+		"    where "
+		"      k = NEW.k AND "
+		"      start = NEW.start AND "
+		"      end < NEW.end; "
+		"  select raise(ignore); "
+		" END; ", NULL, NULL, NULL);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not create sqlite trigger in file %s: %s", index_fn, sqlite3_errmsg(db));
+		return;
+	}
+
+
+	/* done. */
+	valid = true;
+	return;
 }
+
+
 
 template <class T>
 IndexFiles<T>::~IndexFiles() {
-	delete[] file_number;
-	delete[] file_number_oldest;
-	pthread_mutex_destroy(&file_number_mutex);
+	/* close db */
+	if (stmt) {
+		sqlite3_finalize(stmt);
+		stmt = NULL;
+	}
+	if (in_transaction) {
+		sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+		in_transaction = false;
+	}
+	if (db) {
+		sqlite3_close(db);
+		db = NULL;
+	}
 }
 
-template <class T>
-char *IndexFiles<T>::getFilename(int aggregation_level, uint32_t file_number) {
-	int fn_size;
-	char *fn;
 
-	// length of filename: 
-	//    pathname + 
-	//    '/' +                 (1)
-	//    indexname + 
-	//    '_' +                 (1)
-	//    aggregation_level +   (2)
-	//    '_'                   (1)
-	//    filenumber +          (8)
-	//    '\0'                  (1)
-	//                     Sum: 14
-	fn_size = pathname.length() + indexname.length() + 14;
-	fn = (char *)malloc(fn_size);
-	snprintf(fn, fn_size, "%s/%s_%02x_%08x", pathname.c_str(), indexname.c_str(), aggregation_level, file_number);
-	return fn;
-}
 
 template <class T>
 void IndexFiles<T>::lookup(IntervalSet *iset, IndexField *key, tm_time_t t0, tm_time_t t1) {
-	int level;
-	uint32_t curfile;
-	IndexFileReader *ifr;
-	char *fname;
+	char index_fn[PATH_MAX];
+	sqlite3* qdb = NULL;
+	sqlite3_stmt* qstmt = NULL;
+	int rc = 0;
 
-	lock_file_numbers();
-	for(level=num_aggregate_levels-1; level>=0; level--) {
-		for(curfile = file_number_oldest[level]; curfile < file_number[level]; curfile++) {
-			fname = getFilename(level, curfile);
-			// fname is now owned by IndexFileReader
-			ifr = new IndexFileReader(fname);
-			if ((t1+1e3 > ifr->getFirst()) && (t0-1e3 < ifr->getLast())) {
-				tmlog(TM_LOG_DEBUG, "query", "IndexFiles::lookupmem: [t0,t1]=[%lf,%lf], curIdxFile=[%lf,%lf]",
-						t0, t1, ifr->getFirst(), ifr->getLast());
-				// the intervals [t0,t1] and [first,last] intersect 
-				// ==> look for matches
-				ifr->lookupEntry(iset, key);
-			}
-			delete ifr;
-		}
+	/* since this may run in a different thread, use a separate database connection */
+
+	/* figure out the file name */
+	memset(index_fn, 0, PATH_MAX);
+	snprintf(index_fn, PATH_MAX, "%s/%s.sqlite", pathname.c_str(), indexname.c_str());
+
+	/* open database */
+	rc = sqlite3_open_v2(index_fn, &qdb, SQLITE_OPEN_READONLY, NULL);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "[lookup] Could not open sqlite file %s: %s", index_fn, sqlite3_errmsg(qdb));
+		return;
 	}
-	unlock_file_numbers();
+
+	/* set some pragmas. they can silently fail and the DB will still work */
+	sqlite3_exec(qdb, "PRAGMA synchronous = OFF;", NULL, NULL, NULL); // quick but dangerous. don't crash the host.
+	sqlite3_exec(qdb, "PRAGMA automatic_index = false;", NULL, NULL, NULL);
+	sqlite3_exec(qdb, "PRAGMA mmap_size = 1073741824;", NULL, NULL, NULL);
+
+	/* prepare statement */
+	rc = sqlite3_prepare_v2(qdb,
+		"SELECT start, end from tm_index where k = ? AND end >= ? AND start <= ?;",
+		-1, &qstmt, NULL);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "[lookup] Could not prepare query: %s", sqlite3_errmsg(qdb));
+		sqlite3_close(qdb);
+		return;
+	}
+
+	/* bind values */
+	rc = sqlite3_reset(qstmt);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "[lookup] Could not reset statement: %s", sqlite3_errmsg(qdb));
+		sqlite3_finalize(qstmt);
+		sqlite3_close(qdb);
+		return;
+	}
+
+	rc = sqlite3_bind_blob(qstmt, 1, key->getConstKeyPtr(), key->getKeySize(), SQLITE_STATIC);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "[lookup] Could not bind key value: %s", sqlite3_errmsg(qdb));
+		sqlite3_finalize(qstmt);
+		sqlite3_close(qdb);
+		return;
+	}
+
+	rc = sqlite3_bind_double(qstmt, 2, t0 - EPS);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "[lookup] Could not bind t0 value: %s", sqlite3_errmsg(qdb));
+		sqlite3_finalize(qstmt);
+		sqlite3_close(qdb);
+		return;
+	}
+
+	rc = sqlite3_bind_double(qstmt, 3, t1 + EPS);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "[lookup] Could not bind t1 value: %s", sqlite3_errmsg(qdb));
+		sqlite3_finalize(qstmt);
+		sqlite3_close(qdb);
+		return;
+	}
+
+
+	while (1) {
+		/* try to execute query */
+		int tries;
+		rc = SQLITE_DONE;
+		for (tries = 10; tries > 0; tries--) {
+			rc = sqlite3_step(qstmt);
+			if (rc == SQLITE_ROW || rc == SQLITE_DONE) {
+				break;
+			}
+			usleep(210000); // not a multiple of the other usleep() call
+		}
+				
+		/* stop if no rows */
+		if (rc != SQLITE_ROW) {
+			break;
+		}
+
+		Interval iv = Interval(sqlite3_column_double(qstmt, 0), sqlite3_column_double(qstmt, 1));
+		tmlog(TM_LOG_DEBUG, "query", "IFR::lookupEntry: adding interval [%lf,%lf]",
+		                                iv.getStart(), iv.getLast());
+		iset->add(iv);
+	}
+
+	rc = sqlite3_finalize(qstmt);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "[lookup] Could not finalize statement: %s", sqlite3_errmsg(qdb));
+		sqlite3_close(qdb);
+		return;
+	}
+
+	sqlite3_close(qdb);
+	return;
 }
 
-#define EPS 1e-3
+
 template <class T>
-void IndexFiles<T>::writeIndex( IndexHash *ih) {
-	FILE *fp;
-	char *new_file_name;
+void IndexFiles<T>::writeIndex(IndexHash *ih) {
 	IndexEntry *ie;
 	const Interval *ci;
-	tm_time_t interval[2];  // the current interval
-	tm_time_t range[2] = {0, 0};  // First TS in index and last TS in index
+	int rc;
 	uint32_t keysize = 0;
+	uint32_t count = 0;
 
-	lock_file_numbers();
-	new_file_name = getFilename(0, file_number[0]);
-	unlock_file_numbers();
-	fp = fopen(new_file_name, "wb");
-	if (fp == NULL) {
-		tmlog(TM_LOG_ERROR, T::getIndexNameStatic().c_str(), "Could not open file %s for writing.", new_file_name);
+	/* start the iterator */
+	ih->initWalk();
+	ie = ih->getNextDelete();
+
+	/* stop here if nothing to do */
+	if (ie == NULL) {
 		ih->clear();
 		return;
 	}
-	fseek(fp, 2*sizeof(tm_time_t)+sizeof(keysize), SEEK_SET);
-	ih->initWalk();
-	ie=ih->getNextDelete();
-	if (ie) {
-		keysize = ie->getKey()->getKeySize();
+
+	/* get key size */
+	keysize = ie->getKey()->getKeySize();
+
+	/* prepare to insert */
+	rc = sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not begin sql transaction: %s", sqlite3_errmsg(db));
+		// don't clear ih, in case error is transient
+		return;
 	}
-	int count = 0;
+	in_transaction = true;
+
+	rc = sqlite3_prepare_v2(db,
+		"INSERT into tm_index (k, start, end) values(?,?,?);",
+		-1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not prepare sql: %s", sqlite3_errmsg(db));
+		sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+		in_transaction = false;
+		// don't clear ih, in case error is transient
+		return;
+	}
+	
+	
+	/* insert index entries */
 	while(ie)  {
 		count++;
 		ci = ie->getIntList();
@@ -267,178 +280,94 @@ void IndexFiles<T>::writeIndex( IndexHash *ih) {
 		// using do ... while is safe, since getIntList will always return a valid
 		// pointer
 		do {
-			my_fwrite(ie->getKey()->getConstKeyPtr(), 1, keysize, fp);
-			interval[0] = (*ci).getStart();
-			interval[1] = (*ci).getLast();
-			if (interval[0] < range[0] || (range[0] < EPS)) 
-				range[0] = interval[0];
-			if (interval[1] > range[1])
-				range[1] = interval[1];
-			my_fwrite(interval, sizeof(tm_time_t), 2, fp);
+			rc = sqlite3_reset(stmt);
+			if (rc != SQLITE_OK) {
+				tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not reset stmt handle: %s", sqlite3_errmsg(db));
+				sqlite3_finalize(stmt);
+				stmt = NULL;
+				sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+				in_transaction = false;
+				return;
+			}
+
+			/* bind values */
+			rc = sqlite3_bind_blob(stmt, 1, ie->getKey()->getConstKeyPtr(), keysize, SQLITE_STATIC);
+			if (rc != SQLITE_OK) {
+				tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not bind key value: %s", sqlite3_errmsg(db));
+				sqlite3_finalize(stmt);
+				stmt = NULL;
+				sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+				in_transaction = false;
+				return;
+			}
+
+			rc = sqlite3_bind_int64(stmt, 2, (((int64_t)(*ci).getStart()) / 60) * 60   );
+			if (rc != SQLITE_OK) {
+				tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not bind start value: %s", sqlite3_errmsg(db));
+				sqlite3_finalize(stmt);
+				stmt = NULL;
+				sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+				in_transaction = false;
+				return;
+			}
+
+			rc = sqlite3_bind_int64(stmt, 3, ((((int64_t)(*ci).getLast()) / 60) + 1) * 60);;
+			if (rc != SQLITE_OK) {
+				tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not bind end value: %s", sqlite3_errmsg(db));
+				sqlite3_finalize(stmt);
+				stmt = NULL;
+				sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+				in_transaction = false;
+				return;
+			}
+
+			/* do the deed */
+			rc = sqlite3_step(stmt);
+			if (rc != SQLITE_DONE) {
+				tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not execute statement: %s", sqlite3_errmsg(db));
+				sqlite3_finalize(stmt);
+				stmt = NULL;
+				sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+				in_transaction = false;
+				return;
+			}
+
 			ci = ci->getNextPtr();
 		} while(ci);
 		ie=ih->getNextDelete();
 	}
-	tmlog(TM_LOG_DEBUG, T::getIndexNameStatic().c_str(), 
-			"Heigth of tree was: %d. level=%d. we wrote %d entries.", ih->height, ih->level, count);
-	rewind(fp);
-	my_fwrite(range, sizeof(tm_time_t), 2, fp);
-	keysize = htonl(keysize);
-	my_fwrite(&keysize, sizeof(keysize), 1, fp);
-	fclose(fp);
-	free(new_file_name);
-	lock_file_numbers();
-	file_number[0]++;
-	unlock_file_numbers();
-}
 
-/** Check if there are any files to aggregate. If so: aggregate them. */
-template <class T>
-void IndexFiles<T>::aggregate(tm_time_t oldestTimestampDisk) {
-	char *oldest_fname;
-	IndexFileReader *ifr;
-	// Aggregate each level
-	for (int level=0; level<num_aggregate_levels-1; level++) {
-		aggregate_internal(level);
-	}
-	// On the highest aggregation level: check if the oldest file can be removed. It
-	// can be removed if all of its entries have been evicted from disk. 
-	// 
-	// Note: We only check for the oldest file. It might be that the second oldest file
-	// could also be removed but we just rely on the fact, that the aggregation thread
-	// will call aggregate() often enough so we don't need to loop here. 
-	lock_file_numbers(); 
-	// check if there's at least one file at the hightes aggregation level
-	if (file_number[num_aggregate_levels-1] != file_number_oldest[num_aggregate_levels-1]) {
-		oldest_fname = getFilename(num_aggregate_levels-1, file_number_oldest[num_aggregate_levels-1]);
-		ifr = new IndexFileReader(oldest_fname);
-		if (ifr->getLast() < oldestTimestampDisk) {
-			unlink(oldest_fname);
-			file_number_oldest[num_aggregate_levels-1]++;
-		}
-		delete ifr;
-	}
-	unlock_file_numbers();
-	
-}
 
-/** Aggregate IDX_AGGREGATE_COUNT files starting with file number fn_min  
- *  of level level
- *  into one index file of level+1. Aggregated files are unlinked. The
- *  file_number settings are adjusted accordingly
- *
- * @param level aggregation level to start with. writeIndex will write files
- * with aggregation level 0.
- */
-template <class T>
-void IndexFiles<T>::aggregate_internal(int level) {
-	std::vector<IndexFileReader *> ifr_vec;
-	std::vector<IndexFileReader *>::iterator it;
-	struct timeval tv1, tv2, tvtmp;
-	IndexFileReader *greatest;
-	FILE *ofp;
-
-	char *of_name;
-	char *if_name;
-	int keysize, entrysize;
-	tm_time_t range[2];
-	int fn_min;
-	int count;
-
-	lock_file_numbers();
-	if (file_number[level] - file_number_oldest[level]  < IDX_AGGREGATE_COUNT) {
-		unlock_file_numbers();
+	/* done inserting */
+	rc = sqlite3_finalize(stmt);
+	stmt = NULL;
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not finalize statement: %s", sqlite3_errmsg(db));
+		sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+		in_transaction = false;
 		return;
 	}
-	fn_min = file_number_oldest[level];
-	count = IDX_AGGREGATE_COUNT;
-
-	of_name = getFilename(level+1, file_number[level+1]);
-	unlock_file_numbers();
-
-	ofp = fopen(of_name, "wb");
-
-	//XXX MAybe change to DEUBG level
-	tmlog(TM_LOG_NOTE, "aggregate", "New file is %s\n", of_name);
-	for (int i=fn_min; i<fn_min+count; i++) {
-		if_name = getFilename(level, i);
-		// if_name is now owned by the IndexFileReader
-		ifr_vec.push_back(new IndexFileReader(if_name));
-	}
-	keysize = (ifr_vec.front())->getKeySize();
-	entrysize = (ifr_vec.front())->getEntrySize();
-
-	range[0] = ifr_vec.front()->getFirst();
-	range[1] = ifr_vec.front()->getLast();
-	for (it = ifr_vec.begin(); it!=ifr_vec.end(); it++) {
-		if ((*it)->getFirst() < range[0])
-			range[0] = (*it)->getFirst();
-		if ((*it)->getLast() > range[1])
-			range[1] = (*it)->getLast();
-	}
-	my_fwrite(range, sizeof(tm_time_t), 2, ofp);
-	keysize = htonl( (ifr_vec.front())->getKeySize());
-	my_fwrite(&keysize, sizeof(keysize), 1, ofp);
-	fflush(ofp);
-	keysize = (ifr_vec.front())->getKeySize();
-
-	int i=0;
-	//unsigned int usec = 500*1000; // 500 ms
-	gettimeofday(&tv1, NULL);
-	tvtmp = tv1;
-	while (!ifr_vec.empty()) {
-		greatest = NULL;
-		for (it = ifr_vec.begin(); it!=ifr_vec.end(); it++) {
-			// If the current file is already exhausted, delete it from the
-			// vector. Since erasing an element from a vector invalidates all
-			// iterators, we mus break the for loop
-			if ((*it)->getCurEntry() == NULL) { 
-				delete (*it);
-				ifr_vec.erase(it); 
-				greatest=NULL;
-				//fprintf(stderr, "IFR deleted. %d\n", i);
-				break;
-			}
-			if (greatest == NULL)
-				greatest = (*it);
-			if (memcmp(greatest->getCurEntry(), (*it)->getCurEntry(), keysize) < 0)
-				greatest = *it;
+	
+	/* sometimes the db is locked from a query thead. try again a few times */
+	int tries;
+	for (tries = 1000; tries > 0; --tries) {
+		rc = sqlite3_exec(db, "END TRANSACTION;", NULL, NULL, NULL);
+		if (rc == SQLITE_OK || rc != SQLITE_BUSY) {
+			break;
 		}
-		if (greatest != NULL) {
-			my_fwrite(greatest->getCurEntry(), entrysize, 1, ofp);
-			greatest->readNextEntry();
-			i++;
-		}
-		/* Give the rest of the tm time to breath */
-		/*
-		if (i%50000 == 0) {
-			gettimeofday(&tv2, NULL);
-			if (to_tm_time(&tv2)-to_tm_time(&tv1)<2.5) {
-				log_file->log("aggregate", "Sleeping for file  %s \n", of_name);
-				usleep(usec);
-				gettimeofday(&tv1, NULL);
-			}
-		}
-		*/
+		usleep(100000);
 	}
-	gettimeofday(&tv2, NULL);
-	fclose(ofp);
-	tmlog(TM_LOG_DEBUG, "aggregate", "File %s done. It took %lf sec", of_name, to_tm_time(&tv2)-to_tm_time(&tvtmp));
-	free(of_name);
-	lock_file_numbers();
-	file_number[level+1]++;
-	file_number_oldest[level] = fn_min+count;
-	unlock_file_numbers();
-	// The file_numbers are now updated. We can now remove the files that we
-	// just aggregated.
-	for (int i=fn_min; i<fn_min+count; i++) {
-		if_name = getFilename(level, i);
-		unlink(if_name);
-		free(if_name);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not commit transaction: %s", sqlite3_errmsg(db));
+		sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+		in_transaction = false;
+		return;
 	}
-	// Decouple aggregate runs
-	sleep(IDX_MIN_TIME_BETWEEN_AGGREGATE );
 }
+
+/** No need to aggregate */
+
+
 
 
 

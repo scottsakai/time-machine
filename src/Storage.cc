@@ -1,6 +1,7 @@
 #include <pcap.h>
 #include <pthread.h>
 #include <limits.h>
+#include <signal.h>
 
 #include <sstream>
 #include <iostream>
@@ -72,7 +73,7 @@ Storage::Storage(StorageConfig& conf):
 		snaplen(SNAPLEN),
 		conns(1000000),
 		dynclasses(25000),
-tot_num_queries(0) {
+		tot_num_queries(0) {
 	//FIXME: Deallocate fifos when throwing an exception !!!
 	//FIXME: Same for indexes
 	char errbuf[PCAP_ERRBUF_SIZE]; 
@@ -330,13 +331,6 @@ void Storage::addPkt(const struct pcap_pkthdr *header,
 		 * the subscriptions target is gone, the subscription will be removed in the
 		 * end 
 		 */
-	}
-}
-
-
-void Storage::aggregateIndexFiles() {
-	for (std::list<IndexType*>::iterator i=indexes->begin(); i!=indexes->end(); i++) {
-		(*i)->aggregate();
 	}
 }
 

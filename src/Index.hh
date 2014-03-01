@@ -152,8 +152,6 @@ public:
 	 *  TODO: we might want to make storage a global singleton ... 
 	 */
 	virtual void setStorage(Storage *arg_storage)=0;
-	/** Aggregate / Merge disk index files into larger files */
-	virtual void aggregate() = 0;
 	virtual const std::string getIndexName()=0;
 	virtual uint64_t getNumEntriesRAM()=0;
 	virtual uint64_t getNumEntriesDisk()=0;
@@ -225,7 +223,6 @@ public:
 	void setStorage(Storage *arg_storage) {
 		storage = arg_storage;
 	}
-	void aggregate();
 	void run();
 	virtual const std::string getIndexName() {
 		return T::getIndexNameStatic();

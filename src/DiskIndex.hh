@@ -13,6 +13,7 @@
 #include "IndexField.hh"
 #include "IndexEntry.hh"
 #include "IndexHash.hh"
+#include "sqlite3/sqlite3.h"
 
 
 /* forward declaration */
@@ -21,22 +22,8 @@ class Storage;
 /*
  * Organisation on Disk: 
  * The index maintainer threads writes in regular intervals (on every rotate)
- * the index entries to file. This file is sorted, to enable fast disk lookups
- * using bianary search. I.e. a lookup on disk requires to search every file. 
- *
- * Since we have to search every file and since the files are rather small, we
- * want to aggregate / merge several of these smaller files into larger
- * files. It's possible to repeat this multiple times to get an aggregation
- * hierachy with several aggregation levels. When a file is written to disk, it
- * is of aggregation level 0. Several of these level 0 files (say 10) are then
- * aggregated into one file of level 1, agein several level 1 files can be aggregated
- * into one level 2 file. 
- *
- * The aggregation thread is responsible to for this aggregation of files. The 
- * file_number[level] and file_number_oldest[level] arrays are used to keep track of the
- * current files of a given level on disk. file_number_oldest is the oldest file (the
- * one with the lowest number) on disk. file_number is the next file number that is 
- * not yet written. 
+ * the index entries to file. This file is an sqlite3 database.  Sqlite3 will
+ * take care of all of the i/o and storage nuances.
  *
  * 
  ***************************************************************************
@@ -70,47 +57,6 @@ class Storage;
  *
  */
 
-/***************************************************************************
- * class IndexFilesReader
- *
- * Transparent access to index files stored on disk. Entries can read in 
- * ascending  order and searches/lookups in the file can be done. 
- *
- * The filename pointer passed to the constructor will be owned by
- * IndexFileReader and free()'d upon object destruction
- *
- * FIXME: IndexFileReader is not templated and parts of the implementation
- * are rather large, so it might be a good idea to move it to a seperate
- * file, which gets compiled to a distinct object file. 
- */
-class IndexFileReader {
-	public:
-		IndexFileReader(char *fn);
-		~IndexFileReader();
-		tm_time_t getFirst() {
-			return first;
-		}
-		tm_time_t getLast() {
-			return last;
-		}
-		uint32_t getKeySize() {
-			return keysize;
-		}
-		uint32_t getEntrySize() {
-			return entrysize;
-		}
-		const void *getCurEntry();
-		void readNextEntry();
-		void lookupEntry(IntervalSet *set, IndexField *key);
-	protected:
-		FILE *fp;
-		char *fname;
-		tm_time_t first, last;
-		uint32_t keysize;
-		size_t entrysize;
-		void *buffer;
-		bool eof;
-};
 
 /***************************************************************************
  * class DiskIndex
@@ -121,35 +67,27 @@ public:
 	DiskIndex() {};
 	virtual void lookup(IntervalSet *iset, IndexField *key, tm_time_t t0, tm_time_t t1) = 0;
 	virtual void writeIndex( IndexHash *ih) = 0;
-	virtual void aggregate(tm_time_t oldestTimestampDisk) = 0;
 	virtual ~DiskIndex() {}
 };
 
 template <class T> class IndexFiles: DiskIndex {
 public:
 	IndexFiles(const std::string& pathname, const std::string& indexname);
-	 ~IndexFiles();
+	~IndexFiles();
 	void lookup(IntervalSet *iset, IndexField *key, tm_time_t t0, tm_time_t t1);
 	void writeIndex(IndexHash *ih);
-	void aggregate(tm_time_t oldestTimestampDisk);
+	bool inTransaction() { return in_transaction; }
+	bool isValid() { return valid; }
 protected:
-	void lock_file_numbers() {
-		pthread_mutex_lock(&file_number_mutex);
-	}
-	void unlock_file_numbers() {
-		pthread_mutex_unlock(&file_number_mutex);
-	}
-	void aggregate_internal(int level);
-	// Returns a malloc'ed buffer containing the filename for this index.
-	// You must free() the filename after use
-	char *getFilename(int aggregation_level, uint32_t file_number); 
 	std::string indexname;
 	std::string pathname;
-	int num_aggregate_levels;
-	uint32_t *file_number;
-	uint32_t *file_number_oldest;
-	pthread_mutex_t file_number_mutex;
+	bool valid;
+	sqlite3* db;
+	sqlite3_stmt* stmt;
+	bool in_transaction;
 };
+
+
 
 #include "DiskIndex.cc"
 

@@ -351,7 +351,10 @@ uint64_t FifoMem::query(QueryRequest *qreq, QueryResult *qres,
 #endif
 			while ( (p_will_wrap || (p<=lp)) 
 					&& pkt_t(p) <= i->getLast() ) {
-				if (qreq->matchPkt(p) && last_match_ts < pkt_t(p))  {
+				if ( qreq->matchPkt(p) && 
+				     (pkt_t(p) >= qreq->getT0()) &&
+				     (pkt_t(p) <= qreq->getT1()) ){
+
 					qres->sendPkt(p);
 					if (qreq->isSubscribe()) {
 						c_id = new ConnectionID4(block(p)+sizeof(struct pcap_pkthdr));
