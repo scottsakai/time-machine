@@ -21,6 +21,7 @@
 
 #include <sys/stat.h>
 #include <dirent.h>
+#include <limits.h>
 #include "util.h"
 
 
@@ -40,20 +41,57 @@ IndexFiles<T>::IndexFiles(const std::string& pathname, const std::string& indexn
 		valid(false),
 		db(NULL),
 		stmt(NULL),
-		in_transaction(false)
+		in_transaction(false),
+		entries(0),
+		earliest(ULLONG_MAX),
+		latest(0)
 {
-	int rc = 0;
-
 	
+	/* dig up the existing current file */
+	if (loadCurrentFile() != true) {
+		return;
+	}
+
+	/* done. */
+	valid = true;
+	return;
+}
+
+
+
+template <class T>
+IndexFiles<T>::~IndexFiles() {
+	closeCurrentFile();
+}
+
+
+/* Load or create a new sqlite database file.
+ * If an existing current file is present, load it.
+ * To create an empty current database, move the existing one first!
+ * Returns true on success, false on failure
+ */
+template <class T>
+bool IndexFiles<T>::loadCurrentFile() {
+  	sqlite3_stmt* qstmt = NULL;
+	int rc;
+
+	/* close the current file if open */
+	if (db != NULL) {
+		closeCurrentFile();
+	}
+
+	/* reset counters */
+	entries = 0;
+
 	/* we're going to stash everything in one sqlite file per indexname */
 	char index_fn[PATH_MAX];
 	memset(index_fn, 0, PATH_MAX);
-	snprintf(index_fn, PATH_MAX, "%s/%s.sqlite", pathname.c_str(), indexname.c_str());
+	snprintf(index_fn, PATH_MAX, "%s/%s-current.sqlite", pathname.c_str(), indexname.c_str());
 
 	/* open db */
 	if (sqlite3_open_v2(index_fn, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL)) {
 		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not open sqlite file %s: %s", index_fn, sqlite3_errmsg(db));
-		return;
+		return false;
 	}
 
 	/* set some pragmas. they can silently fail and the DB will still work */
@@ -62,25 +100,22 @@ IndexFiles<T>::IndexFiles(const std::string& pathname, const std::string& indexn
 	sqlite3_exec(db, "PRAGMA mmap_size = 1073741824;", NULL, NULL, NULL);
 
 	/* create the table if it doesn't exist. */
-	rc = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS tm_index (k BLOB, start REAL, end REAL);", NULL, NULL, NULL);
+	rc = sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS tm_index (k BLOB, start INT, end INT);", NULL, NULL, NULL);
 	if (rc != SQLITE_OK) {
 		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not create sqlite table in file %s: %s", index_fn, sqlite3_errmsg(db));
-		return;
+		return false;
 	}
+
 
 	/* create indexes on the table if they don't exist. */
 	// most searches will be against 'k'
 	rc = sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS index_tm_index_k ON tm_index(k)", NULL, NULL, NULL);
 	if (rc != SQLITE_OK) {
 		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not create sqlite index on k in file %s: %s", index_fn, sqlite3_errmsg(db));
-		return;
+		return false;
 	}
-	// preening happens on 'end'
-	rc = sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS index_tm_index_end ON tm_index(end)", NULL, NULL, NULL);
-	if (rc != SQLITE_OK) {
-		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not create sqlite index on end in file %s: %s", index_fn, sqlite3_errmsg(db));
-		return;
-	}
+
+
 	// do some deduplication
 	rc = sqlite3_exec(db, "CREATE TRIGGER IF NOT EXISTS tm_insert_dedup BEFORE INSERT ON tm_index "
 		" for each row when (select k from tm_index where k = NEW.k and start = NEW.start) IS NOT NULL "
@@ -95,19 +130,46 @@ IndexFiles<T>::IndexFiles(const std::string& pathname, const std::string& indexn
 		" END; ", NULL, NULL, NULL);
 	if (rc != SQLITE_OK) {
 		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not create sqlite trigger in file %s: %s", index_fn, sqlite3_errmsg(db));
-		return;
+		return false;
 	}
 
 
-	/* done. */
-	valid = true;
-	return;
+	/* pull stats */
+	tmlog(TM_LOG_NOTE, indexname.c_str(), "Querying stats for tm_index in file: %s", index_fn);
+
+	rc = sqlite3_prepare_v2(db,
+		"SELECT count(*), min(start), max(end) from tm_index;",
+		-1, &qstmt, NULL);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not prepare stats query for table tm_index in file: %s %s", index_fn, sqlite3_errmsg(db));
+		return false;
+	}
+	// db should not be locked yet. it's either new or we're called from
+	// the constructor at startup
+	rc = sqlite3_step(qstmt);
+	if (rc != SQLITE_ROW) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not execute stats query for table tm_index in file: %s %s", index_fn, sqlite3_errmsg(db));
+		return false;
+	}
+	entries = sqlite3_column_int64(qstmt, 0);
+	earliest = sqlite3_column_int64(qstmt, 1);
+	latest = sqlite3_column_int64(qstmt, 2);
+	rc = sqlite3_finalize(qstmt);
+	if (rc != SQLITE_OK) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not finalize stats query for table tm_index in file %s %s", index_fn, sqlite3_errmsg(db));
+		return false;
+	}
+	tmlog(TM_LOG_NOTE, indexname.c_str(), "Loaded stats from file: %s - entries %llu, earliest %llu, latest %llu", index_fn, entries, earliest, latest);
+
+
+	/* all done! */
+	return true;
 }
 
 
-
+/* Close the current sqlite database file */
 template <class T>
-IndexFiles<T>::~IndexFiles() {
+void IndexFiles<T>::closeCurrentFile() {
 	/* close db */
 	if (stmt) {
 		sqlite3_finalize(stmt);
@@ -123,6 +185,32 @@ IndexFiles<T>::~IndexFiles() {
 	}
 }
 
+
+/* Rotate (out) the current sqlite database file and bring in a new one */
+template <class T>
+void IndexFiles<T>::rotateCurrentFile() {
+	int rc = 0;
+
+	// identify src (current) and dst (archived) filenames
+	char index_fn_src[PATH_MAX];
+	char index_fn_dst[PATH_MAX];
+	memset(index_fn_src, 0, PATH_MAX);
+	memset(index_fn_dst, 0, PATH_MAX);
+
+	closeCurrentFile();
+
+	snprintf(index_fn_src, PATH_MAX, "%s/%s-current.sqlite", pathname.c_str(), indexname.c_str());
+
+	snprintf(index_fn_dst, PATH_MAX, "%s/%s-archived-%llu-%llu.sqlite", pathname.c_str(), indexname.c_str(), (long long unsigned int)earliest, (long long unsigned int)latest);
+
+	rc = rename(index_fn_src, index_fn_dst);
+	if (rc != 0) {
+		tmlog(TM_LOG_ERROR, indexname.c_str(), "Unable to rename %s to %s: %s", index_fn_src, index_fn_dst, strerror(errno));
+	}
+
+	// make sure db points to something useful
+	loadCurrentFile();
+}
 
 
 template <class T>
@@ -234,6 +322,8 @@ void IndexFiles<T>::writeIndex(IndexHash *ih) {
 	IndexEntry *ie;
 	const Interval *ci;
 	int rc;
+	uint64_t start = 0;
+	uint64_t last = 0;
 	uint32_t keysize = 0;
 	uint32_t count = 0;
 
@@ -301,7 +391,9 @@ void IndexFiles<T>::writeIndex(IndexHash *ih) {
 				return;
 			}
 
-			rc = sqlite3_bind_int64(stmt, 2, (((int64_t)(*ci).getStart()) / 60) * 60   );
+			start = (((int64_t)(*ci).getStart()) / 60) * 60;
+			if (start < earliest || earliest == 0) earliest = start;
+			rc = sqlite3_bind_int64(stmt, 2, start);
 			if (rc != SQLITE_OK) {
 				tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not bind start value: %s", sqlite3_errmsg(db));
 				sqlite3_finalize(stmt);
@@ -311,7 +403,9 @@ void IndexFiles<T>::writeIndex(IndexHash *ih) {
 				return;
 			}
 
-			rc = sqlite3_bind_int64(stmt, 3, ((((int64_t)(*ci).getLast()) / 60) + 1) * 60);;
+			last = ((((int64_t)(*ci).getLast()) / 60) + 1) * 60;
+			if (last > latest) latest = last;
+			rc = sqlite3_bind_int64(stmt, 3, last);;
 			if (rc != SQLITE_OK) {
 				tmlog(TM_LOG_ERROR, indexname.c_str(), "Could not bind end value: %s", sqlite3_errmsg(db));
 				sqlite3_finalize(stmt);
@@ -363,6 +457,11 @@ void IndexFiles<T>::writeIndex(IndexHash *ih) {
 		in_transaction = false;
 		return;
 	}
+
+	entries += count;
+
+	/* rotate out if too many entries */
+	if (entries > IDX_MAX_ENTRIES) rotateCurrentFile();
 }
 
 /** No need to aggregate */

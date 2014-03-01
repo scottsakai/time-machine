@@ -78,6 +78,10 @@ public:
 	void writeIndex(IndexHash *ih);
 	bool inTransaction() { return in_transaction; }
 	bool isValid() { return valid; }
+private:
+	bool loadCurrentFile();
+	void closeCurrentFile();
+	void rotateCurrentFile();
 protected:
 	std::string indexname;
 	std::string pathname;
@@ -85,6 +89,9 @@ protected:
 	sqlite3* db;
 	sqlite3_stmt* stmt;
 	bool in_transaction;
+	uint64_t entries;
+	uint64_t earliest;
+	uint64_t latest;
 };
 
 

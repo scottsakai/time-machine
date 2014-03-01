@@ -72,6 +72,10 @@ void cmd_parser_finish(void);
 #define IDX_MIN_TIME_BETWEEN_AGGREGATE 10
 
 
+/* (approximately) How many entries to stick in an index before rotating
+ */
+#define IDX_MAX_ENTRIES 10000000
+
 /* Alter the semantics of opening a FifoDiskFile
  * Sometimes we want to truncate the file, other times
  * we might want to try to analyze and load it.
