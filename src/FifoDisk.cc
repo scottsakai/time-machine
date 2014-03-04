@@ -68,39 +68,39 @@ held_bytes(0), held_pkts(0), oldestTimestamp(0), newestTimestamp(0), queries(0) 
 	prefix = classname.c_str();
         prefixlen = strlen(prefix);
 
-        filecount = scandir64("./",&flist,ScandirFileMatch,alphasort64);
+        filecount = scandir64("./", &flist, ScandirFileMatch, alphasort64);
 
         //fprintf(stderr,"Found %d files\n",filecount);
 
-        for(i = 0; i< filecount; i++){
+        for (i = 0; i< filecount; i++){
 
 		struct stat64 fileinfo;
 
                 /* can we access the file? */
-                if(stat64(flist[i]->d_name,&fileinfo) != 0) continue;
+                if (stat64(flist[i]->d_name, &fileinfo) != 0) continue;
 
                 /* is it a FILE? */
-                if(!S_ISREG(fileinfo.st_mode)) continue;
+                if (!S_ISREG(fileinfo.st_mode)) continue;
 
 
 		/* check out the filename */
 	
 		/* sanity check: no way in hell we'll get a match */
-        	if(strlen(flist[i]->d_name) < prefixlen)  continue;
+        	if (strlen(flist[i]->d_name) < prefixlen)  continue;
 
    		/* pah. not a match */
-        	if(strncmp(flist[i]->d_name,prefix,prefixlen) != 0) continue;
+        	if (strncmp(flist[i]->d_name, prefix, prefixlen) != 0) continue;
 
 		/* yank out the fileno from the name */
-		sscanf( flist[i]->d_name + prefixlen + 1, "%x", &localfileno);
+		sscanf(flist[i]->d_name + prefixlen + 1, "%x", &localfileno);
 		// fprintf(stderr,"%s: examined file number %d\n",__FUNCTION__,localfileno);
-		if(localfileno > file_number) file_number = localfileno;
+		if (localfileno > file_number) file_number = localfileno;
 
 
 		/* attempt to load the file */
 		files.push_back(new FifoDiskFile(flist[i]->d_name, pcap_handle));  
 		/* don't use failed attempts */
-		if(!files.back()->valid()){
+		if (!files.back()->valid()){
 			delete(files.back());
 			files.pop_back();
 		}
@@ -113,10 +113,10 @@ held_bytes(0), held_pkts(0), oldestTimestamp(0), newestTimestamp(0), queries(0) 
 			held_pkts += files.back()->getHeldPkts();
 				
 			/* timestamp fun */
-			if(files.back()->getOldestTimestamp() < oldestTimestamp 
+			if (files.back()->getOldestTimestamp() < oldestTimestamp 
 			|| oldestTimestamp == 0) 
 				oldestTimestamp = files.back()->getOldestTimestamp();
-			if(files.back()->getNewestTimestamp() > newestTimestamp)
+			if (files.back()->getNewestTimestamp() > newestTimestamp)
 				 newestTimestamp = files.back()->getNewestTimestamp();
 		}
 						

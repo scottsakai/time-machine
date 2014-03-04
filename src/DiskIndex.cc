@@ -23,6 +23,7 @@
 #include <dirent.h>
 #include <limits.h>
 #include "util.h"
+#include <regex.h>
 
 
 // use epsilon to enlarge time range by "just a little"
@@ -213,18 +214,83 @@ void IndexFiles<T>::rotateCurrentFile() {
 }
 
 
+/* 
+    Examine indicies between t0 and t1 for start/end entries associated with key.
+    Place results in iset.
+*/
 template <class T>
 void IndexFiles<T>::lookup(IntervalSet *iset, IndexField *key, tm_time_t t0, tm_time_t t1) {
 	char index_fn[PATH_MAX];
+	char filter[PATH_MAX];
+	char scan_template[PATH_MAX];
+	regex_t re_filter;
+	int filecount, i, rc;
+	long long unsigned int f_start, f_end;
+	struct dirent64 **flist;
+
+	/* We'll need to use a regex to filter files */
+	memset(filter, 0, PATH_MAX);
+	snprintf(filter, PATH_MAX, "^%s/%s-archived-[[:digit:]][[:digit:]]*-[[:digit:]][[:digit:]]*\\.sqlite$", pathname.c_str(), indexname.c_str());
+	rc =  regcomp(&re_filter, filter, 0);
+	if (rc != 0) {
+	    tmlog(TM_LOG_ERROR, "lookup", "Could not compile file filter regex");
+	    return;
+	}
+
+	/* template for sscanf */
+	memset(scan_template, 0, PATH_MAX);
+	snprintf(scan_template, PATH_MAX, "%s-archived-%%llu-%%llu", indexname.c_str());
+
+	/* Start with the current disk index */
+	memset(index_fn, 0, PATH_MAX);
+	snprintf(index_fn, PATH_MAX, "%s/%s-current.sqlite", pathname.c_str(), indexname.c_str());
+	lookupFile(index_fn, iset, key, t0, t1);
+
+	/* Now go through all candidate archive files */
+	filecount = scandir64(pathname.c_str(), &flist, ScandirFileMatch, alphasort64);
+	for (i = 0; i < filecount; i++) {
+		struct stat64 fileinfo;
+
+		snprintf(index_fn, PATH_MAX, "%s/%s", pathname.c_str(), flist[i]->d_name);
+
+		/* simple sanity checks */
+		// access?
+		if (stat64(index_fn, &fileinfo) != 0) continue;
+		// regular file?
+		if (!S_ISREG(fileinfo.st_mode)) continue;
+
+		// matches filter?
+		if (regexec(&re_filter, index_fn, 0, NULL, 0) != 0) continue;
+
+		/* get time range from file name (note: use bare name here) */
+		rc = sscanf(flist[i]->d_name, scan_template, &f_start, &f_end);
+		if (rc != 2) continue;
+
+		/* skip files outside range */
+		if (f_start > t1 || f_end < t0) continue;
+
+		/* do the lookup */
+		lookupFile(index_fn, iset, key, t0, t1);
+	}
+
+	// done!
+ 	regfree(&re_filter);
+	return;
+}
+
+
+/*
+    Examine index_fn between t0 and t1 for start/end entries associated with key.
+    Place results in iset.
+    Called by lookup()
+*/
+template <class T>
+void IndexFiles<T>::lookupFile(char* index_fn, IntervalSet *iset, IndexField *key, tm_time_t t0, tm_time_t t1) {
 	sqlite3* qdb = NULL;
 	sqlite3_stmt* qstmt = NULL;
 	int rc = 0;
 
 	/* since this may run in a different thread, use a separate database connection */
-
-	/* figure out the file name */
-	memset(index_fn, 0, PATH_MAX);
-	snprintf(index_fn, PATH_MAX, "%s/%s.sqlite", pathname.c_str(), indexname.c_str());
 
 	/* open database */
 	rc = sqlite3_open_v2(index_fn, &qdb, SQLITE_OPEN_READONLY, NULL);

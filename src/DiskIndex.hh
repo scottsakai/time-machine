@@ -82,6 +82,7 @@ private:
 	bool loadCurrentFile();
 	void closeCurrentFile();
 	void rotateCurrentFile();
+	void lookupFile(char* index_fn, IntervalSet *iset, IndexField *key, tm_time_t t0, tm_time_t t1);
 protected:
 	std::string indexname;
 	std::string pathname;

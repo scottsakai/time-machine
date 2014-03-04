@@ -226,12 +226,12 @@ uint64_t Fifo::query(QueryRequest *qreq, QueryResult *qres,
 			cur_file = intersectedFiles.front();
 			intersectedFiles.pop();
 
-			tmlog(TM_LOG_WARN, "query", "%d Fifo::query: start-end=[%lf,%lf] * curfile=[%lf,%lf] * fn=%s",
-				qres->getQueryID(), qreq->getT0(), qreq->getT1(), 
-				cur_file->getOldestTimestamp(), cur_file->getNewestTimestamp(),
-				cur_file->getFilename().c_str());
+			// tmlog(TM_LOG_WARN, "query", "%d Fifo::query: start-end=[%lf,%lf] * curfile=[%lf,%lf] * fn=%s",
+			//	qres->getQueryID(), qreq->getT0(), qreq->getT1(), 
+			//	cur_file->getOldestTimestamp(), cur_file->getNewestTimestamp(),
+			//	cur_file->getFilename().c_str());
 
-			tmlog(TM_LOG_WARN, "query", "%d Fifo::query: Searching file %s", qres->getQueryID(), cur_file->getFilename().c_str());
+			// tmlog(TM_LOG_WARN, "query", "%d Fifo::query: Searching file %s", qres->getQueryID(), cur_file->getFilename().c_str());
 
 			matches+= cur_file->query(qreq, qres, interval_set);
 		}
