@@ -6,20 +6,21 @@ main {
 
 	## Directories for packet captures, logs, and indexes. 
 	## These directories must exist when timemachine starts!
-	workdir "/var/timemachine";
-	indexdir "indexes/";
-	queryfiledir "queries/";
+	workdir "@CMAKE_INSTALL_PREFIX@/var/tm";
+	## These will be relative to <workdir> if not 
+	## given as full paths.
+	indexdir "indexes";
+	queryfiledir "queries";
 
 	## Name for the log to be stored in <workdir>
 	logfile "timemachine.log";
 
 	## Set this value to '1' if you'd like timemachine to
 	## start in daemon mode.
-	daemon 0;
+	daemon 1;
 	## If you are running in daemon mode, this setting 
 	## MUST be set to '0'
-	console 1;
-
+	console 0;
 	
 	## How often in seconds timemachine should log statistical 
 	## information.
